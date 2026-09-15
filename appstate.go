@@ -21,6 +21,7 @@ import (
 	waBinary "go.mau.fi/whatsmeow/binary"
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/proto/waServerSync"
+	"go.mau.fi/whatsmeow/proto/waSyncAction"
 	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
@@ -83,7 +84,6 @@ func (cli *Client) fetchAppState(ctx context.Context, name appstate.WAPatchName,
 		hasMore = patches.HasMorePatches
 		state, err = cli.applyAppStatePatches(ctx, name, state, patches, fullSync, eventsToDispatchPtr)
 		if err != nil {
-			cli.dispatchEvent(&events.AppStateSyncError{Name: name, FullSync: fullSync, Error: err})
 			return nil, err
 		}
 	}
@@ -161,6 +161,8 @@ func (cli *Client) applyAppStatePatches(
 	if err != nil {
 		if errors.Is(err, appstate.ErrKeyNotFound) {
 			go cli.requestMissingAppStateKeys(context.WithoutCancel(ctx), patches)
+		} else {
+			cli.dispatchEvent(&events.AppStateSyncError{Name: name, FullSync: fullSync, Error: err})
 		}
 		return state, fmt.Errorf("failed to decode app state %s patches: %w", name, err)
 	}
@@ -233,6 +235,19 @@ func (cli *Client) dispatchAppState(ctx context.Context, name appstate.WAPatchNa
 		logEvt.Any("action", mutation.Action)
 	}
 	logEvt.Msg("Received app state mutation")
+
+	if len(mutation.Index) == 1 && mutation.Index[0] == appstate.IndexNCTSaltSync {
+		var err error
+		if mutation.Operation == waServerSync.SyncdMutation_SET {
+			err = cli.storeNCTSalt(ctx, mutation.Action.GetNctSaltSyncAction().GetSalt())
+		} else if mutation.Operation == waServerSync.SyncdMutation_REMOVE {
+			err = cli.clearNCTSalt(ctx)
+		}
+		if err != nil {
+			cli.Log.Warnf("Failed to update NCT salt from app state mutation: %v", err)
+		}
+		return
+	}
 
 	if mutation.Operation != waServerSync.SyncdMutation_SET {
 		return
@@ -403,6 +418,21 @@ func (cli *Client) dispatchAppState(ctx context.Context, name appstate.WAPatchNa
 			Action:       act,
 			FromFullSync: fullSync,
 		}
+	case appstate.IndexWasaRootSecretAction:
+		if len(mutation.Index) < 2 {
+			return
+		}
+		botJID, _ := types.ParseJID(mutation.Index[1])
+		ownLID := cli.getOwnLID()
+		inputSecrets := mutation.Action.GetWasaRootSecretAction().GetSecrets()
+		storeUpdateError = cli.Store.MsgSecrets.PutMessageSecrets(ctx, exslices.CastFunc(inputSecrets, func(secret *waSyncAction.WASARootSecretAction_RootSecretEntry) store.MessageSecretInsert {
+			return store.MessageSecretInsert{
+				Chat:   botJID,
+				Sender: ownLID,
+				ID:     secret.GetID(),
+				Secret: secret.GetRootSecret(),
+			}
+		}))
 	}
 	if storeUpdateError != nil {
 		cli.Log.Errorf("Failed to update device store after app state mutation: %v", storeUpdateError)
@@ -551,9 +581,9 @@ func (cli *Client) sendAppState(ctx context.Context, patch appstate.PatchInfo, a
 	if respCollectionAttr.OptionalString("type") == "error" {
 		errorTag, ok := respCollection.GetOptionalChildByTag("error")
 
-		mainErr := fmt.Errorf("%w: %s", ErrAppStateUpdate, respCollection.XMLString())
+		mainErr := fmt.Errorf("%w: %s", ErrAppStateUpdate, &respCollection)
 		if ok {
-			mainErr = fmt.Errorf("%w (%s): %s", ErrAppStateUpdate, patch.Type, errorTag.XMLString())
+			mainErr = fmt.Errorf("%w (%s): %s", ErrAppStateUpdate, patch.Type, &errorTag)
 		}
 		if ok && errorTag.AttrGetter().Int("code") == 409 && allowRetry {
 			zerolog.Ctx(ctx).Warn().Err(mainErr).Msg("Failed to update app state, trying to apply conflicts and retry")
@@ -561,7 +591,7 @@ func (cli *Client) sendAppState(ctx context.Context, patch appstate.PatchInfo, a
 			patches, err := appstate.ParsePatchList(ctx, &respCollection, cli.downloadExternalAppStateBlob)
 			if err != nil {
 				return fmt.Errorf("%w (also, parsing patches in the response failed: %w)", mainErr, err)
-			} else if state, err = cli.applyAppStatePatches(ctx, patch.Type, state, patches, false, &eventsToDispatch); err != nil {
+			} else if _, err = cli.applyAppStatePatches(ctx, patch.Type, state, patches, false, &eventsToDispatch); err != nil {
 				return fmt.Errorf("%w (also, applying patches in the response failed: %w)", mainErr, err)
 			} else {
 				zerolog.Ctx(ctx).Debug().Msg("Retrying app state send after applying conflicting patches")

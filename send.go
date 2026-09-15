@@ -33,7 +33,6 @@ import (
 	"go.mau.fi/whatsmeow/proto/waAICommon"
 	"go.mau.fi/whatsmeow/proto/waCommon"
 	"go.mau.fi/whatsmeow/proto/waE2E"
-	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 )
@@ -127,6 +126,9 @@ type SendResponse struct {
 	// The identity the message was sent with (LID or PN)
 	// This is currently not reliable in all cases.
 	Sender types.JID
+
+	// The chat JID the message was actually sent to.
+	Chat types.JID
 }
 
 // SendRequestExtra contains the optional parameters for SendMessage.
@@ -245,6 +247,9 @@ func (cli *Client) SendMessage(ctx context.Context, to types.JID, message *waE2E
 	}
 
 	if isBotMode {
+		// TODO Muse/Hatch messages need to be wrapped
+		//      They probably also don't have the same persona ID as Meta AI
+
 		if message.MessageContextInfo.BotMetadata == nil {
 			message.MessageContextInfo.BotMetadata = &waAICommon.BotMetadata{
 				PersonaID: proto.String("867051314767696$760019659443059"),
@@ -323,7 +328,11 @@ func (cli *Client) SendMessage(ctx context.Context, to types.JID, message *waE2E
 		resp.DebugTimings.GetParticipants = time.Since(start)
 	} else if to.Server == types.HiddenUserServer {
 		ownID = cli.getOwnLID()
-	} else if to.Server == types.DefaultUserServer && cli.Store.LIDMigrationTimestamp > 0 && !req.Peer {
+		extraParams.peerRecipientPN, err = cli.Store.LIDs.GetPNForLID(ctx, to)
+		if err != nil {
+			cli.Log.Warnf("Failed to get peer recipient PN for %s: %v", to, err)
+		}
+	} else if to.Server == types.DefaultUserServer && !req.Peer {
 		start := time.Now()
 		var toLID types.JID
 		toLID, err = cli.Store.LIDs.GetLIDForPN(ctx, to)
@@ -332,6 +341,7 @@ func (cli *Client) SendMessage(ctx context.Context, to types.JID, message *waE2E
 			return
 		} else if toLID.IsEmpty() {
 			var info map[types.JID]types.UserInfo
+			cli.Log.Debugf("LID for %s not found, fetching user info", to)
 			info, err = cli.GetUserInfo(ctx, []types.JID{to})
 			if err != nil {
 				err = fmt.Errorf("failed to get user info for %s to fill LID cache: %w", to, err)
@@ -342,7 +352,8 @@ func (cli *Client) SendMessage(ctx context.Context, to types.JID, message *waE2E
 			}
 		}
 		resp.DebugTimings.LIDFetch = time.Since(start)
-		cli.Log.Debugf("Replacing SendMessage destination with LID as migration timestamp is set %s -> %s", to, toLID)
+		cli.Log.Debugf("Replacing SendMessage destination with LID %s -> %s", to, toLID)
+		extraParams.peerRecipientPN = to
 		to = toLID
 		ownID = cli.getOwnLID()
 	}
@@ -365,6 +376,7 @@ func (cli *Client) SendMessage(ctx context.Context, to types.JID, message *waE2E
 	}
 
 	resp.Sender = ownID
+	resp.Chat = to
 
 	start := time.Now()
 	// Sending multiple messages at a time can cause weird issues and makes it harder to retry safely
@@ -743,6 +755,7 @@ type nodeExtraParams struct {
 	metaNode        *waBinary.Node
 	additionalNodes *[]waBinary.Node
 	addressingMode  types.AddressingMode
+	peerRecipientPN types.JID
 }
 
 func (cli *Client) sendGroup(
@@ -868,19 +881,19 @@ func (cli *Client) sendDM(
 		node.Content = append(node.GetChildren(), cli.getMessageReportingToken(messagePlaintext, message, ownID, to, id))
 	}
 
-	// 🔒 FIX: Verificar se PrivacyTokens está inicializado antes de usar
-	var tcToken *store.PrivacyToken
-	if cli.Store != nil && cli.Store.PrivacyTokens != nil {
-		var err error
-		tcToken, err = cli.Store.PrivacyTokens.GetPrivacyToken(ctx, to)
-		if err != nil {
-			cli.Log.Warnf("Failed to get privacy token for %s: %v", to, err)
-		}
+	tcTokenBytes, tcErr := cli.ensureTCToken(ctx, to)
+	if tcErr != nil {
+		cli.Log.Warnf("Failed to get privacy token for %s: %v", to, tcErr)
 	}
-	if tcToken != nil {
+	if len(tcTokenBytes) > 0 {
 		node.Content = append(node.GetChildren(), waBinary.Node{
 			Tag:     "tctoken",
-			Content: tcToken.Token,
+			Content: tcTokenBytes,
+		})
+	} else if csToken := cli.generateCsToken(ctx, to); len(csToken) > 0 {
+		node.Content = append(node.GetChildren(), waBinary.Node{
+			Tag:     "cstoken",
+			Content: csToken,
 		})
 	}
 
@@ -890,6 +903,12 @@ func (cli *Client) sendDM(
 	if err != nil {
 		return "", nil, fmt.Errorf("failed to send message node: %w", err)
 	}
+
+	storageJID := cli.resolveTCTokenStorageLID(ctx, to)
+	if shouldSendTCTokenInChatAction(to) && shouldSendNewTCToken(cli.getTCTokenSenderTS(storageJID)) {
+		go cli.issuePrivacyTokenAndSave(storageJID, time.Now())
+	}
+
 	return phash, data, nil
 }
 
@@ -1041,6 +1060,8 @@ func getEditAttribute(msg *waE2E.Message) types.EditAttribute {
 		return types.EditAttributeSenderRevoke
 	case msg.KeepInChatMessage != nil && msg.KeepInChatMessage.GetKey().GetFromMe() && msg.KeepInChatMessage.GetKeepType() == waE2E.KeepType_UNDO_KEEP_FOR_ALL:
 		return types.EditAttributeSenderRevoke
+	case msg.PinInChatMessage != nil:
+		return types.EditAttributePinInChat
 	}
 	return types.EditAttributeEmpty
 }
@@ -1061,7 +1082,7 @@ func (cli *Client) preparePeerMessageNode(
 	if message.GetProtocolMessage().GetType() == waE2E.ProtocolMessage_APP_STATE_SYNC_KEY_REQUEST {
 		attrs["push_priority"] = "high"
 	} else if message.GetProtocolMessage().GetPeerDataOperationRequestMessage().GetPeerDataOperationRequestType() == waE2E.PeerDataOperationRequestType_HISTORY_SYNC_ON_DEMAND {
-		//attrs["push_priority"] = "high_force"
+		attrs["push_priority"] = "high_force"
 		attrs["privacy_sensitive"] = "1"
 	}
 	start := time.Now()
@@ -1180,6 +1201,9 @@ func (cli *Client) prepareMessageNode(
 		"type": msgType,
 		"to":   to,
 	}
+	if !extraParams.peerRecipientPN.IsEmpty() {
+		attrs["peer_recipient_pn"] = extraParams.peerRecipientPN
+	}
 	// TODO this is a very hacky hack for announcement group messages, why is it pn anyway?
 	if extraParams.addressingMode != "" {
 		attrs["addressing_mode"] = string(extraParams.addressingMode)
@@ -1278,6 +1302,9 @@ func (cli *Client) encryptMessageForDevices(
 	sessionAddressToJID := make(map[string]types.JID, len(allDevices))
 	sessionAddresses := make([]string, 0, len(allDevices))
 	for _, jid := range allDevices {
+		if jid == ownJID || jid == ownLID {
+			continue
+		}
 		encryptionIdentity := jid
 		if jid.Server == types.DefaultUserServer {
 			// TODO query LID from server for missing entries
@@ -1306,10 +1333,10 @@ func (cli *Client) encryptMessageForDevices(
 
 	for _, jid := range allDevices {
 		plaintext := msgPlaintext
+		if jid == ownJID || jid == ownLID {
+			continue
+		}
 		if (jid.User == ownJID.User || jid.User == ownLID.User) && dsmPlaintext != nil {
-			if jid == ownJID || jid == ownLID {
-				continue
-			}
 			plaintext = dsmPlaintext
 		}
 		encrypted, isPreKey, err := cli.encryptMessageForDeviceAndWrap(
